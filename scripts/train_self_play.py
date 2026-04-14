@@ -1,5 +1,4 @@
 import os
-import csv
 import random
 from collections import deque
 
@@ -9,19 +8,12 @@ import torch.nn as nn
 import torch.optim as optim
 
 from envs.battleship_rl_env import BattleshipSingleAgentEnv, BOARD_SIZE
+from scripts.heatmap_policy import hybrid_pick_action
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class QNetCNN(nn.Module):
-    """
-    Wejście: (B, 1, 10, 10)
-    Kanał zawiera:
-      0 = nieznane
-      1 = pudło
-      2 = trafienie
-    Wyjście: Q-values dla 100 akcji.
-    """
     def __init__(self, out_dim=BOARD_SIZE * BOARD_SIZE):
         super().__init__()
         self.features = nn.Sequential(
@@ -40,174 +32,157 @@ class QNetCNN(nn.Module):
         )
 
     def forward(self, x):
-        x = self.features(x)
-        return self.head(x)
+        return self.head(self.features(x))
 
 
 class ReplayBuffer:
-    def __init__(self, capacity=150_000):
+    def __init__(self, capacity=200_000):
         self.buf = deque(maxlen=capacity)
 
-    def push(self, s, a, r, s2, d, m2):
-        self.buf.append((s, a, r, s2, d, m2))
+    def push(self, s, a, r, ns, done, mask, nmask):
+        self.buf.append((s, a, r, ns, done, mask, nmask))
 
-    def sample(self, batch_size):
+    def sample(self, batch_size=128):
         batch = random.sample(self.buf, batch_size)
-        s, a, r, s2, d, m2 = zip(*batch)
+        s, a, r, ns, d, m, nm = zip(*batch)
         return (
-            np.array(s, dtype=np.float32),    # (B, 10, 10)
-            np.array(a, dtype=np.int64),      # (B,)
-            np.array(r, dtype=np.float32),    # (B,)
-            np.array(s2, dtype=np.float32),   # (B, 10, 10)
-            np.array(d, dtype=np.float32),    # (B,)
-            np.array(m2, dtype=np.int8),      # (B, 100)
+            np.array(s, dtype=np.float32),     # (B,10,10)
+            np.array(a, dtype=np.int64),       # (B,)
+            np.array(r, dtype=np.float32),     # (B,)
+            np.array(ns, dtype=np.float32),    # (B,10,10)
+            np.array(d, dtype=np.float32),     # (B,)
+            np.array(m, dtype=np.int8),        # (B,100)
+            np.array(nm, dtype=np.int8),       # (B,100)
         )
 
     def __len__(self):
         return len(self.buf)
 
 
-def save_checkpoint(model, path):
-    torch.save(model.state_dict(), path)
-
-
-def soft_update(target, source, tau=0.01):
-    for tp, sp in zip(target.parameters(), source.parameters()):
-        tp.data.copy_(tp.data * (1.0 - tau) + sp.data * tau)
-
-
-def select_action(model, state, mask, epsilon):
-    legal = np.where(mask == 1)[0]
+def select_action(model, obs, action_mask, eps, alpha=0.55, beta=0.35):
+    legal = np.where(action_mask == 1)[0]
     if len(legal) == 0:
         return 0
 
-    if random.random() < epsilon:
+    # eksploracja
+    if np.random.rand() < eps:
         return int(np.random.choice(legal))
 
+    # Q + heatmapa (hybryda)
     with torch.no_grad():
-        s = torch.tensor(state[None, None, :, :], dtype=torch.float32, device=DEVICE)  # (1,1,10,10)
+        s = torch.tensor(obs[None, None, :, :], dtype=torch.float32, device=DEVICE)  # (1,1,10,10)
         q = model(s).cpu().numpy()[0]  # (100,)
-        q_masked = np.full_like(q, -1e9, dtype=np.float32)
-        q_masked[legal] = q[legal]
-        return int(np.argmax(q_masked))
+
+    a = hybrid_pick_action(q_values=q, obs=obs, legal_mask=action_mask, alpha=alpha, beta=beta)
+    return int(a)
 
 
 def train():
-    os.makedirs("checkpoints", exist_ok=True)
-    os.makedirs("checkpoints/opponents", exist_ok=True)
-
-    log_path = "checkpoints/train_log.csv"
-    with open(log_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["episode", "reward", "avg100", "epsilon", "buffer_size"])
-
-    env = BattleshipSingleAgentEnv(seed=42, max_steps=100)
-
-    qnet = QNetCNN().to(DEVICE)
-    target = QNetCNN().to(DEVICE)
-    target.load_state_dict(qnet.state_dict())
-
-    optimizer = optim.Adam(qnet.parameters(), lr=5e-4)
-    replay = ReplayBuffer(capacity=150_000)
-
-    gamma = 0.99
+    episodes = 3000
     batch_size = 128
-    warmup = 6000
-    total_episodes = 5000
-    train_every = 1
-    tau = 0.01
+    gamma = 0.99
+    lr = 1e-4
 
-    epsilon_start, epsilon_end = 1.0, 0.03
+    warmup_steps = 5000
+    target_update_every = 1000
+    train_every = 4
+
+    epsilon_start = 1.0
+    epsilon_end = 0.03
     epsilon_decay_eps = 3500
 
-    step_count = 0
-    best_avg = -1e9
-    rewards_window = deque(maxlen=100)
-    opponent_paths = []
+    # Wpływ heatmapy podczas wyboru akcji (eksploatacja)
+    alpha = 0.55
+    beta = 0.35
 
-    huber = nn.SmoothL1Loss()
+    os.makedirs("checkpoints", exist_ok=True)
 
-    for ep in range(1, total_episodes + 1):
-        state, info = env.reset(seed=1000 + ep * 11)
+    env = BattleshipSingleAgentEnv(max_steps=100)
+    q_net = QNetCNN().to(DEVICE)
+    target_net = QNetCNN().to(DEVICE)
+    target_net.load_state_dict(q_net.state_dict())
+    target_net.eval()
+
+    optimizer = optim.Adam(q_net.parameters(), lr=lr)
+    replay = ReplayBuffer(capacity=200_000)
+
+    best_avg100 = -1e9
+    reward_hist = []
+    global_step = 0
+
+    for ep in range(1, episodes + 1):
+        obs, info = env.reset(seed=ep)
         done = False
         ep_reward = 0.0
 
-        epsilon = max(
+        eps = max(
             epsilon_end,
-            epsilon_start - (epsilon_start - epsilon_end) * (ep / epsilon_decay_eps)
+            epsilon_start - (epsilon_start - epsilon_end) * (ep / epsilon_decay_eps),
         )
 
         while not done:
-            action = select_action(qnet, state, info["action_mask"], epsilon)
-            next_state, reward, terminated, truncated, next_info = env.step(action)
-            done = terminated or truncated
+            a = select_action(q_net, obs, info["action_mask"], eps, alpha=alpha, beta=beta)
+            nobs, r, terminated, truncated, ninfo = env.step(a)
+            done_flag = float(terminated or truncated)
 
-            replay.push(state, action, reward, next_state, done, next_info["action_mask"])
+            replay.push(obs, a, r, nobs, done_flag, info["action_mask"], ninfo["action_mask"])
 
-            state = next_state
-            info = next_info
-            ep_reward += reward
-            step_count += 1
+            obs = nobs
+            info = ninfo
+            ep_reward += r
+            done = bool(done_flag)
+            global_step += 1
 
-            if len(replay) >= warmup and step_count % train_every == 0:
-                s, a, r, s2, d, m2 = replay.sample(batch_size)
+            if len(replay) >= warmup_steps and global_step % train_every == 0:
+                s, a_b, r_b, ns, d_b, m_b, nm_b = replay.sample(batch_size)
 
-                s_t = torch.tensor(s[:, None, :, :], dtype=torch.float32, device=DEVICE)   # (B,1,10,10)
-                s2_t = torch.tensor(s2[:, None, :, :], dtype=torch.float32, device=DEVICE) # (B,1,10,10)
-                a_t = torch.tensor(a, dtype=torch.long, device=DEVICE).unsqueeze(1)        # (B,1)
-                r_t = torch.tensor(r, dtype=torch.float32, device=DEVICE).unsqueeze(1)      # (B,1)
-                d_t = torch.tensor(d, dtype=torch.float32, device=DEVICE).unsqueeze(1)      # (B,1)
-                m2_t = torch.tensor(m2, dtype=torch.bool, device=DEVICE)                    # (B,100)
+                s_t = torch.tensor(s[:, None, :, :], dtype=torch.float32, device=DEVICE)    # (B,1,10,10)
+                ns_t = torch.tensor(ns[:, None, :, :], dtype=torch.float32, device=DEVICE)  # (B,1,10,10)
+                a_t = torch.tensor(a_b, dtype=torch.int64, device=DEVICE)
+                r_t = torch.tensor(r_b, dtype=torch.float32, device=DEVICE)
+                d_t = torch.tensor(d_b, dtype=torch.float32, device=DEVICE)
+                nm_t = torch.tensor(nm_b, dtype=torch.bool, device=DEVICE)  # (B,100)
 
-                # Q(s,a)
-                q_pred = qnet(s_t).gather(1, a_t)
+                q_vals = q_net(s_t)                                # (B,100)
+                q_sa = q_vals.gather(1, a_t.unsqueeze(1)).squeeze(1)
 
-                # Double DQN + legal mask na next actions
                 with torch.no_grad():
-                    q_next_online = qnet(s2_t)  # (B,100)
-                    q_next_online_masked = q_next_online.masked_fill(~m2_t, -1e9)
-                    next_actions = q_next_online_masked.argmax(dim=1, keepdim=True)  # (B,1)
+                    # Double DQN (bez heatmapy w targetach, klasycznie i stabilnie)
+                    q_next_online = q_net(ns_t)                    # (B,100)
+                    q_next_online[~nm_t] = -1e9
+                    next_actions = torch.argmax(q_next_online, dim=1, keepdim=True)
 
-                    q_next_target = target(s2_t).gather(1, next_actions)  # (B,1)
-                    y = r_t + gamma * (1.0 - d_t) * q_next_target
+                    q_next_target = target_net(ns_t)
+                    q_next = q_next_target.gather(1, next_actions).squeeze(1)
 
-                loss = huber(q_pred, y)
+                    target = r_t + (1.0 - d_t) * gamma * q_next
+
+                loss = nn.functional.smooth_l1_loss(q_sa, target)
 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(qnet.parameters(), max_norm=10.0)
+                nn.utils.clip_grad_norm_(q_net.parameters(), 10.0)
                 optimizer.step()
 
-                soft_update(target, qnet, tau=tau)
+                if global_step % target_update_every == 0:
+                    target_net.load_state_dict(q_net.state_dict())
 
-        rewards_window.append(ep_reward)
-        avg100 = float(np.mean(rewards_window))
-
-        with open(log_path, "a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow([ep, ep_reward, avg100, epsilon, len(replay)])
+        reward_hist.append(ep_reward)
+        avg100 = float(np.mean(reward_hist[-100:]))
 
         if ep % 50 == 0:
             print(
                 f"[EP {ep:4d}] reward={ep_reward:7.2f} avg100={avg100:7.2f} "
-                f"eps={epsilon:.3f} buffer={len(replay)}"
+                f"eps={eps:5.3f} buffer={len(replay)}"
             )
 
-        if ep % 25 == 0:
-            save_checkpoint(qnet, "checkpoints/selfplay_latest.pt")
+        torch.save(q_net.state_dict(), "checkpoints/selfplay_latest.pt")
+        if ep >= 100 and avg100 > best_avg100:
+            best_avg100 = avg100
+            torch.save(q_net.state_dict(), "checkpoints/selfplay_best.pt")
 
-        if ep >= 300 and avg100 > best_avg:
-            best_avg = avg100
-            save_checkpoint(qnet, "checkpoints/selfplay_best.pt")
-            opp_path = f"checkpoints/opponents/opp_ep{ep}_avg{avg100:.2f}.pt"
-            save_checkpoint(qnet, opp_path)
-            opponent_paths.append(opp_path)
-
-    save_checkpoint(qnet, "checkpoints/selfplay_final.pt")
-    print("Trening zakończony.")
-    print(f"Best avg100: {best_avg:.2f}")
-    print(f"Opponents saved: {len(opponent_paths)}")
-    print(f"Log CSV: {log_path}")
+    print("Koniec treningu.")
+    print(f"Najlepsze avg100: {best_avg100:.3f}")
 
 
 if __name__ == "__main__":

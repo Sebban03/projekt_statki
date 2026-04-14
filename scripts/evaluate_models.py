@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from envs.battleship_rl_env import BattleshipSingleAgentEnv, BOARD_SIZE
+from scripts.heatmap_policy import hybrid_pick_action
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -28,25 +29,22 @@ class QNetCNN(nn.Module):
         )
 
     def forward(self, x):
-        x = self.features(x)
-        return self.head(x)
+        return self.head(self.features(x))
 
 
-def greedy_action(model, obs, mask):
+def pick_action_eval(model, obs, mask, alpha=0.55, beta=0.35):
     legal = np.where(mask == 1)[0]
     if len(legal) == 0:
         return 0
 
     with torch.no_grad():
-        s = torch.tensor(obs[None, None, :, :], dtype=torch.float32, device=DEVICE)  # (1,1,H,W)
-        q = model(s).cpu().numpy()[0]  # (H*W,)
+        s = torch.tensor(obs[None, None, :, :], dtype=torch.float32, device=DEVICE)
+        q = model(s).cpu().numpy()[0]
 
-    q_masked = np.full_like(q, -1e9, dtype=np.float32)
-    q_masked[legal] = q[legal]
-    return int(np.argmax(q_masked))
+    return int(hybrid_pick_action(q_values=q, obs=obs, legal_mask=mask, alpha=alpha, beta=beta))
 
 
-def run_eval(model_path, episodes=1000, seed_base=10000, max_steps=100):
+def run_eval(model_path, episodes=1000, seed_base=10000, max_steps=100, alpha=0.55, beta=0.35):
     if not os.path.exists(model_path):
         return {"model_path": model_path, "error": "missing_file"}
 
@@ -68,7 +66,7 @@ def run_eval(model_path, episodes=1000, seed_base=10000, max_steps=100):
         terminated_flag = False
 
         while not done:
-            a = greedy_action(model, obs, info["action_mask"])
+            a = pick_action_eval(model, obs, info["action_mask"], alpha=alpha, beta=beta)
             obs, r, terminated, truncated, info = env.step(a)
             ep_reward += r
             ep_len += 1
@@ -94,13 +92,15 @@ def run_eval(model_path, episodes=1000, seed_base=10000, max_steps=100):
         "max_reward": float(np.max(rewards)),
         "avg_episode_len": float(np.mean(lengths)),
         "std_episode_len": float(np.std(lengths)),
+        "alpha": alpha,
+        "beta": beta,
     }
 
 
-def eval_multi_seed(model_path, episodes_per_seed=200, seed_bases=(10000, 20000, 30000, 40000, 50000), max_steps=100):
+def eval_multi_seed(model_path, episodes_per_seed=200, seed_bases=(10000, 20000, 30000, 40000, 50000), max_steps=100, alpha=0.55, beta=0.35):
     runs = []
     for sb in seed_bases:
-        runs.append(run_eval(model_path, episodes=episodes_per_seed, seed_base=sb, max_steps=max_steps))
+        runs.append(run_eval(model_path, episodes=episodes_per_seed, seed_base=sb, max_steps=max_steps, alpha=alpha, beta=beta))
 
     valid_runs = [r for r in runs if "error" not in r]
     if not valid_runs:
@@ -110,7 +110,7 @@ def eval_multi_seed(model_path, episodes_per_seed=200, seed_bases=(10000, 20000,
     avg_rewards = np.array([r["avg_reward"] for r in valid_runs], dtype=np.float32)
     avg_lens = np.array([r["avg_episode_len"] for r in valid_runs], dtype=np.float32)
 
-    summary = {
+    return {
         "model_path": model_path,
         "episodes_total": int(episodes_per_seed * len(valid_runs)),
         "seeds_tested": [int(r["seed_base"]) for r in valid_runs],
@@ -120,17 +120,16 @@ def eval_multi_seed(model_path, episodes_per_seed=200, seed_bases=(10000, 20000,
         "avg_reward_std": float(np.std(avg_rewards)),
         "avg_len_mean": float(np.mean(avg_lens)),
         "avg_len_std": float(np.std(avg_lens)),
+        "alpha": alpha,
+        "beta": beta,
         "runs": runs,
     }
-    return summary
 
 
 def print_single(result):
     if "error" in result:
-        print(f"\nModel: {result['model_path']}")
-        print(f"ERROR: {result['error']}")
+        print(f"\nModel: {result['model_path']}\nERROR: {result['error']}")
         return
-
     print(f"\nModel: {result['model_path']}")
     print(f"Episodes: {result['episodes']}")
     print(f"Seed base: {result['seed_base']}")
@@ -139,12 +138,12 @@ def print_single(result):
     print(f"Std reward: {result['std_reward']:.2f}")
     print(f"Min/Max reward: {result['min_reward']:.2f} / {result['max_reward']:.2f}")
     print(f"Avg episode len: {result['avg_episode_len']:.2f} ± {result['std_episode_len']:.2f}")
+    print(f"Policy mix: alpha={result['alpha']}, beta={result['beta']}")
 
 
 def print_multi(summary):
     if "error" in summary:
-        print(f"\nModel: {summary['model_path']}")
-        print(f"ERROR: {summary['error']}")
+        print(f"\nModel: {summary['model_path']}\nERROR: {summary['error']}")
         return
 
     print(f"\n=== MULTI-SEED SUMMARY ===")
@@ -154,18 +153,14 @@ def print_multi(summary):
     print(f"Win-rate mean ± std: {summary['win_rate_mean']:.3f} ± {summary['win_rate_std']:.3f}")
     print(f"Avg reward mean ± std: {summary['avg_reward_mean']:.2f} ± {summary['avg_reward_std']:.2f}")
     print(f"Avg episode len mean ± std: {summary['avg_len_mean']:.2f} ± {summary['avg_len_std']:.2f}")
+    print(f"Policy mix: alpha={summary['alpha']}, beta={summary['beta']}")
 
     print("\nPer-seed:")
     for r in summary["runs"]:
         if "error" in r:
             print(f"  seed=? -> ERROR: {r['error']}")
         else:
-            print(
-                f"  seed={r['seed_base']}: "
-                f"win={r['win_rate']:.3f}, "
-                f"reward={r['avg_reward']:.2f}, "
-                f"len={r['avg_episode_len']:.2f}"
-            )
+            print(f"  seed={r['seed_base']}: win={r['win_rate']:.3f}, reward={r['avg_reward']:.2f}, len={r['avg_episode_len']:.2f}")
 
 
 def save_json(path, data):
@@ -175,21 +170,21 @@ def save_json(path, data):
 
 
 if __name__ == "__main__":
-    # 1) Szybki test 1000 ep na jednym seedzie
-    single_best = run_eval("checkpoints/selfplay_best.pt", episodes=1000, seed_base=10000, max_steps=100)
-    single_latest = run_eval("checkpoints/selfplay_latest.pt", episodes=1000, seed_base=10000, max_steps=100)
+    alpha = 0.55
+    beta = 0.35
+
+    single_best = run_eval("checkpoints/selfplay_best.pt", episodes=1000, seed_base=10000, max_steps=100, alpha=alpha, beta=beta)
+    single_latest = run_eval("checkpoints/selfplay_latest.pt", episodes=1000, seed_base=10000, max_steps=100, alpha=alpha, beta=beta)
 
     print_single(single_best)
     print_single(single_latest)
 
-    # 2) Mocniejszy test: 5 seedów x 200 ep = 1000 ep łącznie
-    multi_best = eval_multi_seed("checkpoints/selfplay_best.pt", episodes_per_seed=200)
-    multi_latest = eval_multi_seed("checkpoints/selfplay_latest.pt", episodes_per_seed=200)
+    multi_best = eval_multi_seed("checkpoints/selfplay_best.pt", episodes_per_seed=200, alpha=alpha, beta=beta)
+    multi_latest = eval_multi_seed("checkpoints/selfplay_latest.pt", episodes_per_seed=200, alpha=alpha, beta=beta)
 
     print_multi(multi_best)
     print_multi(multi_latest)
 
-    # 3) Zapis do JSON pod raport
     save_json("checkpoints/eval_single_best.json", single_best)
     save_json("checkpoints/eval_single_latest.json", single_latest)
     save_json("checkpoints/eval_multi_best.json", multi_best)

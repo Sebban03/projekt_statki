@@ -52,19 +52,6 @@ def random_place_fleet(rng):
 
 
 class BattleshipSingleAgentEnv(gym.Env):
-    """
-    Obserwacja: 10x10
-      0 = nieznane
-      1 = pudło
-      2 = trafienie
-
-    Akcja: 0..99 (strzał w pole)
-
-    Dodatkowe usprawnienia:
-    - target mode rewards (po trafieniu strzelaj obok)
-    - auto-mark obwódki zatopionego statku jako miss
-    - heurystyczna maska akcji (nie strzelaj w oczywiste śmieci)
-    """
     metadata = {"render_modes": ["human", "ansi"]}
 
     def __init__(self, seed=None, max_steps=100):
@@ -82,21 +69,16 @@ class BattleshipSingleAgentEnv(gym.Env):
         self.obs = None
         self.steps = 0
 
-        # szybkie wykrywanie "świeżych trafień"
-        self.hit_cells_alive = set()  # trafienia należące do statków jeszcze niezatopionych
+        # trafione pola statków, które nie są jeszcze zatopione
+        self.hit_cells_alive = set()
 
     def _get_action_mask(self):
-        """
-        Maska legalnych akcji:
-        - podstawowo: tylko nieodkryte pola (obs==0)
-        - heurystyka: jeśli są "żywe trafienia", preferuj ich sąsiadów ortogonalnych
-          (jeśli brak takich pól, wraca do zwykłej maski)
-        """
         base = (self.obs.reshape(-1) == 0).astype(np.int8)
 
         if not self.hit_cells_alive:
             return base
 
+        # target mode: tylko sąsiedzi ortogonalni (plus), bez skosów
         target = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.int8)
         for (r, c) in self.hit_cells_alive:
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
@@ -106,7 +88,6 @@ class BattleshipSingleAgentEnv(gym.Env):
 
         target_flat = target.reshape(-1)
         if target_flat.sum() > 0:
-            # ogranicz do sensownych strzałów w target mode
             return target_flat
         return base
 
@@ -114,22 +95,17 @@ class BattleshipSingleAgentEnv(gym.Env):
         return self.ship_hits[ship_id] >= len(self.ship_cells[ship_id])
 
     def _mark_sunk_border_as_miss(self, ship_id):
-        """
-        Po zatopieniu statku:
-        - wszystkie pola wokół (8-kierunkowo) oznacz jako miss, jeśli były nieznane.
-        """
         border = set()
         for (r, c) in self.ship_cells[ship_id]:
             for rr in range(max(0, r - 1), min(BOARD_SIZE, r + 2)):
                 for cc in range(max(0, c - 1), min(BOARD_SIZE, c + 2)):
                     border.add((rr, cc))
 
-        # usuń komórki samego statku
         border -= self.ship_cells[ship_id]
 
         for (rr, cc) in border:
             if self.obs[rr, cc] == 0:
-                self.obs[rr, cc] = 1  # miss
+                self.obs[rr, cc] = 1
 
     def reset(self, seed=None, options=None):
         if seed is not None:
@@ -152,7 +128,6 @@ class BattleshipSingleAgentEnv(gym.Env):
         terminated = False
         truncated = False
 
-        # strzał w odkryte pole
         if self.obs[r, c] != 0:
             reward = -1.0
             info = {"action_mask": self._get_action_mask()}
@@ -160,41 +135,32 @@ class BattleshipSingleAgentEnv(gym.Env):
                 truncated = True
             return self.obs.copy(), reward, terminated, truncated, info
 
-        # trafienie
         if self.hidden[r, c] > 0:
             ship_id = int(self.hidden[r, c])
             self.obs[r, c] = 2
             self.ship_hits[ship_id] += 1
             self.hit_cells_alive.add((r, c))
 
-            # bazowy bonus hit
             reward = 1.5
 
-            # target-mode shaping:
-            # bonus jeśli trafiasz obok już znanego żywego trafienia
+            # bonus za kontynuację celu ortogonalnie
             neigh_hit = False
             for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 rr, cc = r + dr, c + dc
                 if 0 <= rr < BOARD_SIZE and 0 <= cc < BOARD_SIZE and self.obs[rr, cc] == 2:
-                    # jeśli sąsiad to też część jakiegoś statku, liczymy jako kontynuację
                     neigh_hit = True
                     break
             if neigh_hit:
                 reward += 0.5
 
-            # zatopienie
             if self._is_ship_sunk(ship_id):
                 reward += 3.0
 
-                # usuń z "alive hits" wszystkie komórki tego statku
                 for cell in self.ship_cells[ship_id]:
-                    if cell in self.hit_cells_alive:
-                        self.hit_cells_alive.remove(cell)
+                    self.hit_cells_alive.discard(cell)
 
-                # oznacz obwódkę zatopionego statku jako miss
                 self._mark_sunk_border_as_miss(ship_id)
 
-            # wygrana
             all_sunk = True
             for sid in self.ship_cells.keys():
                 if self.ship_hits[sid] < len(self.ship_cells[sid]):
@@ -205,11 +171,10 @@ class BattleshipSingleAgentEnv(gym.Env):
                 terminated = True
 
         else:
-            # pudło
             self.obs[r, c] = 1
             reward = -0.20
 
-            # kara, jeśli były niedokończone trafienia a strzał nie był "targetowy"
+            # mocniejsza kara za strzał poza targetem, gdy są aktywne trafienia
             if self.hit_cells_alive:
                 is_target = False
                 for (hr, hc) in self.hit_cells_alive:
@@ -217,7 +182,7 @@ class BattleshipSingleAgentEnv(gym.Env):
                         is_target = True
                         break
                 if not is_target:
-                    reward -= 0.35
+                    reward -= 0.50
 
         if self.steps >= self.max_steps and not terminated:
             truncated = True
@@ -237,5 +202,4 @@ class BattleshipSingleAgentEnv(gym.Env):
             return "\n".join(lines)
 
         if mode == "human":
-            # Prosty human render tekstowy
             print(self.render(mode="ansi"))
